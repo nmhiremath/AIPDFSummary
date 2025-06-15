@@ -1,13 +1,12 @@
 # PDF Processing Application
 
-A modern web application for processing PDF documents using FastAPI, Redis, and React. The application provides a user-friendly interface for uploading PDFs, processing them asynchronously, and viewing the results.
+A modern web application for processing PDF documents using FastAPI, Redis, and React. The application provides a user-friendly interface for uploading PDFs and processing them asynchronously.
 
 ## Features
 
 - PDF document upload and processing
 - Asynchronous processing using Redis and Celery
 - Real-time status updates
-- Redis content viewer for monitoring and debugging
 - Modern React frontend with Material-UI
 - FastAPI backend with comprehensive error handling
 - Docker-based deployment
@@ -32,8 +31,7 @@ A modern web application for processing PDF documents using FastAPI, Redis, and 
 ├── frontend/
 │   ├── src/
 │   │   ├── App.js
-│   │   ├── PDFUploader.js
-│   │   └── RedisViewer.js
+│   │   └── PDFUploader.js
 │   ├── package.json
 │   └── Dockerfile
 ├── docker-compose.yml
@@ -72,16 +70,10 @@ A modern web application for processing PDF documents using FastAPI, Redis, and 
    - View processing status and results
    - Download processed documents
 
-2. **Redis Viewer (http://localhost:3000/redis)**
-   - Monitor Redis contents in real-time
-   - View task statuses and results
-   - Debug processing issues
-
 ## API Endpoints
 
 - `POST /upload/`: Upload a PDF file
 - `GET /status/{task_id}`: Get processing status
-- `GET /redis/contents`: Get Redis contents (for monitoring)
 
 ## Development
 
@@ -142,7 +134,6 @@ A modern web application for processing PDF documents using FastAPI, Redis, and 
    - Verify backend service is running
 
 2. **Processing Status Issues**
-   - Check Redis viewer for task status
    - Verify worker service is running
    - Check backend logs for errors
 

@@ -10,6 +10,7 @@ import io
 from dotenv import load_dotenv
 import logging
 import traceback
+import uuid
 
 # Set up logging
 logging.basicConfig(
@@ -25,22 +26,19 @@ app = FastAPI()
 # Configure CORS
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=["http://localhost:3000"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
 # Initialize Redis client
-redis_client = redis.Redis.from_url(os.getenv("REDIS_URL", "redis://localhost:6379"))
+redis_client = redis.Redis(host='redis', port=6379, db=0, decode_responses=True)
 
-# Verify Redis connection
-try:
-    redis_client.ping()
-    logger.info("Successfully connected to Redis")
-except redis.ConnectionError as e:
-    logger.error(f"Failed to connect to Redis: {str(e)}")
-    raise
+# Create uploads directory if it doesn't exist
+UPLOAD_DIR = "uploads"
+if not os.path.exists(UPLOAD_DIR):
+    os.makedirs(UPLOAD_DIR)
 
 # Initialize Google Gemini
 genai.configure(api_key=os.getenv("GOOGLE_API_KEY"))
@@ -98,68 +96,46 @@ async def generate_summary(text: str) -> str:
         raise
 
 @app.post("/upload")
-async def upload_pdf(
-    file: UploadFile = File(...),
-    parser: Literal["pypdf", "gemini"] = "pypdf"
-):
-    logger.info(f"Received upload request for file: {file.filename} with parser: {parser}")
-    
+async def upload_file(file: UploadFile = File(...), parser: str = "pypdf"):
     if not file.filename.endswith('.pdf'):
-        logger.error(f"Invalid file type: {file.filename}")
         raise HTTPException(status_code=400, detail="Only PDF files are allowed")
     
-    content = await file.read()
-    logger.info(f"Read {len(content)} bytes from file")
+    # Generate unique document ID
+    doc_id = str(uuid.uuid4())
     
-    # Generate a unique ID for this document
-    doc_id = f"doc:{file.filename}"
+    # Save file
+    file_path = os.path.join(UPLOAD_DIR, f"{doc_id}.pdf")
+    with open(file_path, "wb") as buffer:
+        content = await file.read()
+        buffer.write(content)
     
-    try:
-        # Store initial status
-        redis_client.hset(doc_id, mapping={
-            "status": "processing",
-            "filename": file.filename,
-            "parser": parser
-        })
-        logger.info(f"Stored initial status in Redis for {doc_id}")
-        
-        # Add to Redis Stream for processing
-        stream_data = {
-            "doc_id": doc_id,
-            "content": content.hex(),  # Store binary content as hex
-            "parser": parser
-        }
-        stream_id = redis_client.xadd("pdf_processing", stream_data)
-        logger.info(f"Added {doc_id} to processing stream with ID: {stream_id}")
-        
-        return {"doc_id": doc_id, "status": "processing"}
-    except Exception as e:
-        logger.error(f"Error storing document in Redis: {str(e)}")
-        logger.error(traceback.format_exc())
-        raise HTTPException(status_code=500, detail="Error processing document")
+    # Create task in Redis
+    task_data = {
+        "doc_id": doc_id,
+        "file_path": file_path,
+        "parser": parser,
+        "status": "processing"
+    }
+    
+    # Add to Redis Stream
+    redis_client.xadd("pdf_tasks", task_data)
+    
+    return {"doc_id": doc_id, "status": "processing"}
 
 @app.get("/status/{doc_id}")
 async def get_status(doc_id: str):
-    logger.info(f"Checking status for {doc_id}")
-    try:
-        doc_data = redis_client.hgetall(doc_id)
-        if not doc_data:
-            logger.error(f"Document not found: {doc_id}")
-            raise HTTPException(status_code=404, detail="Document not found")
-        
-        status = doc_data.get(b"status", b"").decode()
-        logger.info(f"Status for {doc_id}: {status}")
-        
-        return {
-            "status": status,
-            "filename": doc_data.get(b"filename", b"").decode(),
-            "content": doc_data.get(b"content", b"").decode() if b"content" in doc_data else None,
-            "summary": doc_data.get(b"summary", b"").decode() if b"summary" in doc_data else None
-        }
-    except Exception as e:
-        logger.error(f"Error retrieving status for {doc_id}: {str(e)}")
-        logger.error(traceback.format_exc())
-        raise HTTPException(status_code=500, detail="Error retrieving document status")
+    # Get task status from Redis
+    task_key = f"task:{doc_id}"
+    task_data = redis_client.hgetall(task_key)
+    
+    if not task_data:
+        raise HTTPException(status_code=404, detail="Document not found")
+    
+    return {
+        "status": task_data.get("status", "unknown"),
+        "content": task_data.get("content", ""),
+        "summary": task_data.get("summary", "")
+    }
 
 if __name__ == "__main__":
     import uvicorn
