@@ -33,15 +33,22 @@ app.add_middleware(
 )
 
 # Initialize Redis client
-redis_client = redis.Redis(host='redis', port=6379, db=0, decode_responses=True)
+redis_host = os.environ.get("REDIS_HOST", "localhost")
+redis_client = redis.Redis(host=redis_host, port=6379, db=0, decode_responses=True)
 
 # Create uploads directory if it doesn't exist
-UPLOAD_DIR = "uploads"
+UPLOAD_DIR = os.path.join(os.getcwd(), "uploads")
 if not os.path.exists(UPLOAD_DIR):
     os.makedirs(UPLOAD_DIR)
+    logger.info(f"Created uploads directory at {UPLOAD_DIR}")
 
-# Initialize Google Gemini
-genai.configure(api_key=os.getenv("GOOGLE_API_KEY"))
+# Configure Gemini
+api_key = os.getenv("GOOGLE_API_KEY")
+if not api_key:
+    raise ValueError("GOOGLE_API_KEY environment variable is not set")
+genai.configure(api_key=api_key)
+
+# Initialize Gemini model
 model = genai.GenerativeModel('gemini-2.0-flash')
 
 async def process_with_pypdf(file_content: bytes) -> str:
@@ -112,13 +119,13 @@ async def upload_file(file: UploadFile = File(...), parser: str = "pypdf"):
     # Create task in Redis
     task_data = {
         "doc_id": doc_id,
-        "file_path": file_path,
+        "content": content.hex(),
         "parser": parser,
         "status": "processing"
     }
     
     # Add to Redis Stream
-    redis_client.xadd("pdf_tasks", task_data)
+    redis_client.xadd("pdf_processing", task_data)
     
     return {"doc_id": doc_id, "status": "processing"}
 

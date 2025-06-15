@@ -1,11 +1,11 @@
 # PDF Processing Application
 
-A modern web application for processing PDF documents using FastAPI, Redis, and React. The application provides a user-friendly interface for uploading PDFs and processing them asynchronously.
+A modern web application for processing PDF documents using FastAPI, Redis, and React. The application provides a user-friendly interface for uploading PDFs and processing them asynchronously using Redis Streams.
 
 ## Features
 
 - PDF document upload and processing
-- Asynchronous processing using Redis and Celery
+- Asynchronous processing using Redis Streams
 - Real-time status updates
 - Modern React frontend with Material-UI
 - FastAPI backend with comprehensive error handling
@@ -21,20 +21,21 @@ A modern web application for processing PDF documents using FastAPI, Redis, and 
 
 ```
 .
-├── backend/
-│   ├── app/
-│   │   ├── main.py
-│   │   ├── worker.py
-│   │   └── utils.py
-│   ├── requirements.txt
-│   └── Dockerfile
+├── app/
+│   ├── main.py
+│   ├── worker.py
+│   └── run_worker.py
 ├── frontend/
 │   ├── src/
 │   │   ├── App.js
-│   │   └── PDFUploader.js
+│   │   └── index.js
+│   ├── public/
+│   │   └── index.html
 │   ├── package.json
-│   └── Dockerfile
+│   └── package-lock.json
+├── requirements.txt
 ├── docker-compose.yml
+├── .gitignore
 └── README.md
 ```
 
@@ -53,7 +54,7 @@ A modern web application for processing PDF documents using FastAPI, Redis, and 
    This will start:
    - FastAPI backend (port 8000)
    - Redis server
-   - Celery worker
+   - Worker process
 
 3. Start the frontend development server:
    ```bash

@@ -17,7 +17,8 @@ logger = logging.getLogger(__name__)
 load_dotenv()
 
 # Initialize Redis client
-redis_client = redis.Redis.from_url(os.getenv("REDIS_URL", "redis://localhost:6379"))
+redis_host = os.environ.get("REDIS_HOST", "localhost")
+redis_client = redis.Redis(host=redis_host, port=6379, db=0, decode_responses=True)
 
 # Verify Redis connection
 try:
@@ -49,7 +50,7 @@ async def process_document(doc_id: str, content: bytes, parser: str):
 
         # Update the document status in Redis
         logger.info(f"Updating Redis with results for {doc_id}")
-        redis_client.hset(doc_id, mapping={
+        redis_client.hset(f"task:{doc_id}", mapping={
             "status": "completed",
             "content": text,
             "summary": summary
@@ -59,7 +60,7 @@ async def process_document(doc_id: str, content: bytes, parser: str):
         logger.error(f"Error processing document {doc_id}: {str(e)}")
         logger.error(traceback.format_exc())
         # Update status to error if processing fails
-        redis_client.hset(doc_id, mapping={
+        redis_client.hset(f"task:{doc_id}", mapping={
             "status": "error",
             "error": str(e)
         })
@@ -101,9 +102,9 @@ async def main():
                     logger.info(f"Received new message {message_id}")
                     
                     # Extract message data
-                    doc_id = message[b"doc_id"].decode()
-                    content = bytes.fromhex(message[b"content"].decode())
-                    parser = message[b"parser"].decode()
+                    doc_id = message["doc_id"]
+                    content = bytes.fromhex(message["content"])
+                    parser = message["parser"]
                     
                     logger.info(f"Processing message for document: {doc_id}")
                     # Process the document
