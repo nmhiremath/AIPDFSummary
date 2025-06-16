@@ -1,20 +1,19 @@
 from fastapi import FastAPI, UploadFile, File, HTTPException, Form
 from fastapi.middleware.cors import CORSMiddleware
-import redis
-import json
+from fastapi.responses import JSONResponse
+import redis.asyncio as redis
 import os
-from typing import Literal, Dict
+from typing import Dict
 import google.generativeai as genai
 from pypdf import PdfReader
-import io
 from dotenv import load_dotenv
 import logging
 import traceback
 import uuid
-import asyncio
 import base64
 from pdf2image import convert_from_bytes
-import tempfile
+from utils import get_redis_client
+from io import BytesIO
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -56,210 +55,253 @@ genai.configure(api_key=api_key)
 # Initialize Gemini model
 model = genai.GenerativeModel('gemini-2.0-flash')
 
-# Define prompts for Gemini
-text_extraction_prompt = """You are a PDF text extractor. Your task is to extract ALL text content from the provided image of a PDF page.
-
-IMPORTANT:
-1. Extract ONLY the actual text you see in the image
-2. Preserve the exact text, including numbers, symbols, and formatting
-3. Do not add any explanations or meta-commentary
-4. Do not make assumptions about the content
-5. If you cannot read some text clearly, indicate with [unclear text]
-6. Do not include any instructions or examples in your response
-7. Do not include any markdown formatting
-8. Output ONLY the raw text content you see in the image
-
-Output the raw text content only."""
-
-markdown_conversion_prompt = """You are a text to markdown converter. Convert the following text into clean markdown format.
-
-IMPORTANT:
-1. Preserve the exact content and meaning
-2. Use markdown syntax for:
-   - Headers (# for main headers, ## for subheaders, etc.)
-   - Lists (- for bullet points, 1. 2. 3. for numbered lists)
-   - Tables (using | and -)
-   - Emphasis (* for italic, ** for bold)
-3. Do not add any explanations or meta-commentary
-4. Do not modify the actual content
-5. Keep the original structure and hierarchy
-6. Do not include any instructions or examples in your response
-7. Output ONLY the markdown-formatted text
-
-Output only the markdown-formatted text."""
-
-summary_prompt = """You are a document summarizer. Your task is to provide a concise summary of the following document.
-
-IMPORTANT:
-1. Summarize ONLY the actual content provided
-2. Focus on the main points and key information
-3. Do not add any meta-commentary or explanations
-4. Do not make assumptions about the content
-5. Keep the summary factual and based only on the provided text
-
-Provide a clear, concise summary focusing on the main points and key information."""
-
-async def process_with_pypdf(file_content: bytes) -> str:
-    logger.info("Processing PDF with PyPDF")
-    pdf_file = io.BytesIO(file_content)
-    reader = PdfReader(pdf_file)
-    text = ""
-    for page in reader.pages:
-        text += page.extract_text() + "\n"
-    logger.info(f"Successfully extracted text from PDF (length: {len(text)})")
-    return text
-
-async def process_with_gemini(pdf_content: bytes):
-    """Process PDF content using Gemini Vision API."""
+async def process_with_pypdf(content: bytes) -> dict:
+    """Process PDF content using PyPDF."""
     try:
-        # Initialize Gemini model
-        model = genai.GenerativeModel('gemini-2.0-flash')
+        logger.info("Processing PDF with PyPDF")
         
+        # Create a BytesIO object from the content
+        pdf_file = BytesIO(content)
+        
+        # Create PDF reader
+        pdf_reader = PdfReader(pdf_file)
+        
+        # Extract text from all pages
+        text = ""
+        for page in pdf_reader.pages:
+            text += page.extract_text() + "\n"
+        
+        logger.info(f"Successfully extracted text from PDF (length: {len(text)})")
+        
+        # Generate summary using Gemini
+        prompt = f"""Please analyze the following text and provide a plain text summary (no markdown formatting) with:
+just a single paragraph of a concise summary (2-5 sentences)
+
+Text:
+{text[:10000]}  # Limit to first 10000 chars to avoid token limits
+"""
+        
+        response = await model.generate_content_async(prompt)
+        summary = response.text
+        
+        # Convert the content to markdown format
+        markdown_content = f"""
+
+{text}
+
+---
+*This content was extracted using PyPDF and formatted in markdown.*"""
+        
+        return {
+            "content": markdown_content,
+            "summary": summary
+        }
+    except Exception as e:
+        logger.error(f"Error in process_with_pypdf: {str(e)}")
+        raise
+
+async def process_with_gemini(pdf_content: bytes, doc_id: str, redis_client) -> dict:
+    """Process PDF content using Google's Gemini Vision API."""
+    try:
         # Convert PDF to images
-        logger.info("Converting PDF to images")
         images = convert_from_bytes(pdf_content)
-        logger.info(f"Successfully converted PDF to {len(images)} images")
-        
-        if not images:
-            raise ValueError("No images could be extracted from the PDF")
+        total_pages = len(images)
         
         # Process each page
         all_text = []
-        all_markdown = []
-        
         for i, image in enumerate(images, 1):
-            logger.info(f"Processing page {i}")
+            # Update progress
+            await redis_client.hset(
+                f"document:{doc_id}",
+                mapping={
+                    "progress": f"Processing page {i}/{total_pages}",
+                    "current_step": "process",
+                    "current_step_number": "3"
+                }
+            )
             
-            # Save image to bytes
-            img_byte_arr = io.BytesIO()
-            image.save(img_byte_arr, format='PNG')
-            img_byte_arr = img_byte_arr.getvalue()
+            # Convert image to base64
+            buffered = BytesIO()
+            image.save(buffered, format="PNG")
+            img_str = base64.b64encode(buffered.getvalue()).decode()
             
-            logger.info(f"Saved image for page {i}, size: {len(img_byte_arr)} bytes")
-            logger.info(f"Image dimensions for page {i}: {image.size[0]}x{image.size[1]}")
-            
-            # Extract text using Gemini Vision
-            logger.info(f"Extracting text from page {i}")
+            # Process with Gemini
             response = await model.generate_content_async([
-                "Extract all text from this image, preserving formatting and structure. Include headers, paragraphs, lists, and any other text elements. Return the text exactly as it appears in the image.",
-                {"mime_type": "image/png", "data": img_byte_arr}
+                """Extract and format the text from this image while preserving the exact structure and formatting of the original document. Follow these guidelines:
+
+1. Preserve all original formatting:
+   - Keep exact text alignment and spacing
+   - Maintain original line breaks and paragraphs
+   - Preserve any special characters or symbols
+   - Keep original indentation and lists
+   - Maintain relative text sizes and proportions
+   - Preserve all hyperlinks and URLs exactly as they appear
+
+2. Use markdown formatting to represent the structure:
+   - For headings, observe the visual hierarchy and use appropriate # levels:
+     * Main title (largest): Use # (h1)
+     * Major section: Use ## (h2)
+     * Subsection: Use ### (h3)
+     * Minor section: Use #### (h4)
+     * Small section: Use ##### (h5)
+     * Smallest heading: Use ###### (h6)
+   - For hyperlinks and URLs:
+     * Use [text](url) format for all links
+     * Preserve email addresses as mailto: links
+     * Preserve phone numbers as tel: links
+     * Keep all URLs exactly as they appear
+   - Use - or * for bullet points
+   - Use 1. 2. 3. for numbered lists
+   - Use > for blockquotes
+   - Use ** for bold and * for italic text
+   - Use ``` for code blocks
+   - Use | and - for tables
+
+3. Important:
+   - Do not add any commentary or instructions
+   - Do not modify or interpret the content
+   - Keep the exact text as it appears
+   - Preserve the visual hierarchy of the document
+   - If text is unclear, mark it as [unclear text]
+   - If there are images, describe them as [image: description]
+   - Pay special attention to heading sizes and their relative proportions
+   - Use heading levels that match the visual importance in the original document
+   - If a heading is visually smaller than the main title, use a higher number of # symbols
+   - For contact information (email, phone, website):
+     * Always preserve as clickable links
+     * Keep the exact format of the original
+     * Include all protocol prefixes (http://, https://, mailto:, tel:)
+   - For sections like "Professional Summary" or "Work Experience":
+     * Use appropriate heading level based on visual size
+     * Do not make them larger than they appear in the original
+     * Maintain the same relative size compared to other headings
+
+Output only the formatted text without any additional commentary.""",
+                {
+                    "mime_type": "image/png",
+                    "data": img_str
+                }
             ])
             
-            if not response.text:
-                logger.warning(f"No text extracted from page {i}")
-                continue
-                
-            all_text.append(response.text)
-            
-            # Convert to markdown
-            logger.info(f"Converting page {i} to markdown")
-            markdown_response = await model.generate_content_async([
-                "Convert this text into clean, well-formatted markdown. Preserve the structure, headers, lists, and formatting. Make it readable and properly formatted.",
-                response.text
-            ])
-            
-            if not markdown_response.text:
-                logger.warning(f"Failed to convert page {i} to markdown")
-                continue
-                
-            all_markdown.append(markdown_response.text)
+            # Clean up the response text
+            text = response.text.strip()
+            if text:
+                all_text.append(text)
         
-        if not all_text:
-            raise ValueError("No text could be extracted from any page")
+        # Combine all text and format as markdown
+        content = "\n\n".join(all_text)
+        
+        # Add markdown header and footer
+        markdown_content = f"""
+
+{content}
+
+---
+*This content was extracted using Google's Gemini Vision API and formatted in markdown.*"""
         
         # Generate summary
-        logger.info("Generating summary")
-        summary_response = await model.generate_content_async([
-            "Generate a concise summary of this text. Focus on the main points and key information.",
-            "\n\n".join(all_text)
-        ])
+        await redis_client.hset(
+            f"document:{doc_id}",
+            mapping={
+                "progress": "Generating summary...",
+                "current_step": "summary",
+                "current_step_number": "4"
+            }
+        )
         
-        if not summary_response.text:
-            logger.warning("Failed to generate summary")
-            summary = "Summary generation failed"
-        else:
-            summary = summary_response.text
+        summary_prompt = f"""Please analyze the following text and provide a plain text summary (no markdown formatting) with:
+just a single paragraph of a concise summary (2-5 sentences)
+
+Text:
+{content[:10000]}  # Limit to first 10000 chars to avoid token limits
+"""
+        
+        summary_response = await model.generate_content_async(summary_prompt)
+        summary = summary_response.text
         
         return {
-            "content": "\n\n".join(all_markdown),
+            "content": markdown_content,
             "summary": summary
         }
-        
     except Exception as e:
-        logger.error(f"Error processing PDF: {str(e)}")
-        raise
-
-async def generate_summary(text: str) -> str:
-    logger.info("Generating summary with Gemini")
-    prompt = f"""Provide a concise summary of the following text, focusing on the main points and key information:
-
-{text}"""
-    try:
-        response = model.generate_content(prompt)
-        logger.info(f"Successfully generated summary (length: {len(response.text)})")
-        return response.text
-    except Exception as e:
-        logger.error(f"Error generating summary with Gemini: {str(e)}")
-        logger.error(traceback.format_exc())
+        logger.error(f"Error in process_with_gemini: {str(e)}")
         raise
 
 @app.post("/upload")
 async def upload_file(file: UploadFile = File(...), parser: str = Form("pypdf")):
-    if not file.filename.endswith('.pdf'):
-        raise HTTPException(status_code=400, detail="Only PDF files are allowed")
-    
-    logger.info(f"Received upload request with parser: {parser}")
-    
-    # Read file content
-    content = await file.read()
-    
-    # Validate PDF header
-    if not content.startswith(b'%PDF-'):
-        raise HTTPException(status_code=400, detail="Invalid PDF file: File does not start with PDF header")
-    
-    # Generate unique document ID
-    doc_id = str(uuid.uuid4())
-    
-    # Save file
-    file_path = os.path.join(UPLOAD_DIR, f"{doc_id}.pdf")
-    with open(file_path, "wb") as buffer:
-        buffer.write(content)
-    
-    # Create task in Redis
-    task_data = {
-        "doc_id": doc_id,
-        "content": base64.b64encode(content).decode('utf-8'),  # Store as base64
-        "parser": parser,
-        "status": "processing"
-    }
-    
-    logger.info(f"Sending task to Redis with parser: {parser}")
-    
-    # Add to Redis Stream
-    redis_client.xadd(REDIS_STREAM, task_data)
-    
-    # Create initial task hash in Redis
-    redis_client.hset(f"doc:{doc_id}", mapping={
-        "status": "processing"
-    })
-    
-    return {"doc_id": doc_id, "status": "processing"}
+    """Upload a PDF file and process it."""
+    try:
+        if not file.filename.endswith('.pdf'):
+            raise HTTPException(status_code=400, detail="Only PDF files are allowed")
+        
+        logger.info(f"Received upload request with parser: {parser}")
+        
+        # Read file content
+        content = await file.read()
+        
+        # Validate PDF header
+        if not content.startswith(b'%PDF-'):
+            raise HTTPException(status_code=400, detail="Invalid PDF file: File does not start with PDF header")
+        
+        # Generate a unique ID for the document
+        doc_id = str(uuid.uuid4())
+        
+        # Encode content as base64
+        content_b64 = base64.b64encode(content).decode('utf-8')
+        
+        # Get Redis client
+        redis_client = await get_redis_client(decode_responses=True)
+        
+        # Create task data
+        task_data = {
+            "doc_id": doc_id,
+            "content": content_b64,
+            "parser": parser
+        }
+        
+        # Send task to Redis stream
+        logger.info(f"Sending task to Redis with parser: {parser}")
+        await redis_client.xadd(REDIS_STREAM, task_data)
+        
+        # Set initial status
+        await redis_client.hset(f"document:{doc_id}", mapping={
+            "status": "queued",
+            "progress": "Task queued for processing",
+            "current_step": "init",
+            "total_steps": "5",
+            "current_step_number": "0"
+        })
+        
+        return {"message": "File uploaded successfully", "doc_id": doc_id}
+    except Exception as e:
+        logger.error(f"Error uploading file: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
 
-@app.get("/status/{doc_id}")
-async def get_status(doc_id: str):
-    # Get task status from Redis
-    task_key = f"doc:{doc_id}"
-    task_data = redis_client.hgetall(task_key)
-    
-    if not task_data:
-        raise HTTPException(status_code=404, detail="Document not found")
-    
-    return {
-        "status": task_data.get("status", "unknown"),
-        "content": task_data.get("content", ""),
-        "summary": task_data.get("summary", ""),
-        "error": task_data.get("error", "")
-    }
+@app.get("/status/{document_id}")
+async def get_status(document_id: str):
+    """Get the status of a document processing task."""
+    try:
+        redis_client = await get_redis_client(decode_responses=True)
+        task_data = await redis_client.hgetall(f"document:{document_id}")
+        
+        if not task_data:
+            raise HTTPException(status_code=404, detail="Document not found")
+            
+        return {
+            "status": task_data.get("status", "unknown"),
+            "content": task_data.get("content", ""),
+            "summary": task_data.get("summary", ""),
+            "error": task_data.get("error", ""),
+            "progress": task_data.get("progress", ""),
+            "current_step": task_data.get("current_step", ""),
+            "total_steps": task_data.get("total_steps", "0"),
+            "current_step_number": task_data.get("current_step_number", "0")
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error getting status: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
 
 if __name__ == "__main__":
     import uvicorn
