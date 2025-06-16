@@ -1,4 +1,4 @@
-import redis
+import redis.asyncio as redis
 import os
 import json
 from dotenv import load_dotenv
@@ -6,6 +6,7 @@ import asyncio
 from main import process_with_pypdf, process_with_gemini, generate_summary
 import logging
 import traceback
+import base64
 
 # Set up logging
 logging.basicConfig(
@@ -17,107 +18,151 @@ logger = logging.getLogger(__name__)
 load_dotenv()
 
 # Initialize Redis client
-redis_host = os.environ.get("REDIS_HOST", "localhost")
-redis_client = redis.Redis(host=redis_host, port=6379, db=0, decode_responses=True)
+REDIS_HOST = os.environ.get("REDIS_HOST", "redis")
+REDIS_PORT = int(os.environ.get("REDIS_PORT", 6379))
+REDIS_STREAM = "pdf_tasks"
+REDIS_GROUP = "pdf_workers"
+REDIS_CONSUMER = "worker-1"
 
-# Verify Redis connection
-try:
-    redis_client.ping()
-    logger.info("Successfully connected to Redis")
-except redis.ConnectionError as e:
-    logger.error(f"Failed to connect to Redis: {str(e)}")
-    raise
+async def get_redis_client(decode_responses=True):
+    """Get a Redis client with the specified configuration."""
+    return redis.Redis(
+        host=REDIS_HOST,
+        port=REDIS_PORT,
+        decode_responses=decode_responses
+    )
 
-async def process_document(doc_id: str, content: bytes, parser: str):
+async def process_document(doc_id: str, content: str, parser: str):
+    """Process a document using the specified parser."""
+    redis_client = await get_redis_client(decode_responses=True)
     try:
         logger.info(f"Starting to process document {doc_id} with parser {parser}")
         
-        # Process the document based on the chosen parser
-        if parser == "pypdf":
-            logger.info("Using PyPDF parser")
-            text = await process_with_pypdf(content)
-            logger.info(f"Generated text from PDF (length: {len(text)})")
-            summary = await generate_summary(text)
-            logger.info(f"Generated summary (length: {len(summary)})")
-        else:  # gemini
+        # Decode base64 content
+        try:
+            content_bytes = base64.b64decode(content)
+        except Exception as e:
+            logger.error(f"Error decoding base64 content: {str(e)}")
+            await redis_client.hset(
+                f"doc:{doc_id}",
+                mapping={
+                    "status": "error",
+                    "error": "Invalid content format in Redis"
+                }
+            )
+            raise ValueError("Invalid content format in Redis")
+        
+        # Process with Gemini
+        if parser == "gemini":
             logger.info("Using Gemini parser")
-            result = await process_with_gemini(content)
-            logger.info(f"Generated result from Gemini (length: {len(result)})")
-            # Split the result into markdown and summary
-            parts = result.split("SUMMARY:")
-            text = parts[0].replace("MARKDOWN:", "").strip()
-            summary = parts[1].strip() if len(parts) > 1 else ""
-
-        # Update the document status in Redis
-        logger.info(f"Updating Redis with results for {doc_id}")
-        redis_client.hset(f"task:{doc_id}", mapping={
-            "status": "completed",
-            "content": text,
-            "summary": summary
-        })
-        logger.info(f"Successfully processed {doc_id}")
+            try:
+                result = await process_with_gemini(content_bytes)
+                
+                # Update Redis with results
+                await redis_client.hset(
+                    f"doc:{doc_id}",
+                    mapping={
+                        "status": "completed",
+                        "content": result["content"],
+                        "summary": result["summary"]
+                    }
+                )
+                logger.info(f"Successfully processed document {doc_id}")
+            except ValueError as ve:
+                # Handle validation errors
+                logger.error(f"Validation error for document {doc_id}: {str(ve)}")
+                await redis_client.hset(
+                    f"doc:{doc_id}",
+                    mapping={
+                        "status": "error",
+                        "error": str(ve)
+                    }
+                )
+                raise
+        else:
+            raise ValueError(f"Unsupported parser: {parser}")
+            
     except Exception as e:
         logger.error(f"Error processing document {doc_id}: {str(e)}")
-        logger.error(traceback.format_exc())
-        # Update status to error if processing fails
-        redis_client.hset(f"task:{doc_id}", mapping={
-            "status": "error",
-            "error": str(e)
-        })
+        logger.error(f"Traceback: {e.__traceback__}")
+        # Update Redis with error status
+        await redis_client.hset(
+            f"doc:{doc_id}",
+            mapping={
+                "status": "error",
+                "error": str(e)
+            }
+        )
+        raise
 
 async def main():
-    logger.info("Starting PDF processing worker...")
-    last_id = "0"
-    
-    # Create the stream if it doesn't exist
+    """Main worker loop."""
     try:
-        redis_client.xgroup_create("pdf_processing", "pdf_workers", mkstream=True)
-        logger.info("Created Redis stream group: pdf_workers")
-    except redis.ResponseError as e:
-        if "BUSYGROUP" in str(e):
-            logger.info("Redis stream group already exists")
-        else:
-            logger.error(f"Error creating Redis stream group: {str(e)}")
-            raise
-    
-    while True:
+        # Connect to Redis
+        redis_client = await get_redis_client(decode_responses=True)
+        await redis_client.ping()
+        logger.info("Successfully connected to Redis")
+        
+        # Create consumer group if it doesn't exist
         try:
-            # Read from the stream
-            logger.info("Waiting for new messages in Redis stream...")
-            stream_data = redis_client.xreadgroup(
-                "pdf_workers",
-                "worker1",
-                {"pdf_processing": ">"},
-                count=1,
-                block=1000
-            )
-            
-            if not stream_data:
-                logger.debug("No new messages in stream")
+            await redis_client.xgroup_create(REDIS_STREAM, REDIS_GROUP, mkstream=True)
+            logger.info("Created Redis stream group")
+        except redis.ResponseError as e:
+            if "BUSYGROUP" in str(e):
+                logger.info("Redis stream group already exists")
+            else:
+                raise
+        
+        logger.info("Waiting for new messages in Redis stream...")
+        
+        while True:
+            try:
+                # Read from stream with blocking
+                response = await redis_client.xreadgroup(
+                    REDIS_GROUP,
+                    REDIS_CONSUMER,
+                    {REDIS_STREAM: ">"},
+                    count=1,
+                    block=5000
+                )
+                
+                if not response:
+                    logger.info("No messages received, continuing...")
+                    continue
+                    
+                # Process the message
+                stream, messages = response[0]
+                for message_id, message_data in messages:
+                    try:
+                        doc_id = message_data["doc_id"]
+                        content = message_data["content"]
+                        parser = message_data["parser"]
+                        
+                        logger.info(f"Received new message {message_id}")
+                        logger.info(f"Processing message for document: {doc_id}")
+                        
+                        # Process the document
+                        await process_document(doc_id, content, parser)
+                        
+                        # Acknowledge the message
+                        await redis_client.xack(REDIS_STREAM, REDIS_GROUP, message_id)
+                        logger.info(f"Acknowledged message {message_id}")
+                        
+                    except Exception as e:
+                        logger.error(f"Error processing message {message_id}: {str(e)}")
+                        logger.error(f"Traceback: {e.__traceback__}")
+                        # Don't acknowledge the message so it can be retried
+                        continue
+                    
+            except Exception as e:
+                logger.error(f"Error in main loop: {str(e)}")
+                logger.error(f"Traceback: {e.__traceback__}")
                 continue
                 
-            for stream_id, messages in stream_data:
-                for message_id, message in messages:
-                    last_id = message_id
-                    logger.info(f"Received new message {message_id}")
-                    
-                    # Extract message data
-                    doc_id = message["doc_id"]
-                    content = bytes.fromhex(message["content"])
-                    parser = message["parser"]
-                    
-                    logger.info(f"Processing message for document: {doc_id}")
-                    # Process the document
-                    await process_document(doc_id, content, parser)
-                    
-                    # Acknowledge the message
-                    redis_client.xack("pdf_processing", "pdf_workers", message_id)
-                    logger.info(f"Acknowledged message {message_id}")
-                    
-        except Exception as e:
-            logger.error(f"Error in main loop: {str(e)}")
-            logger.error(traceback.format_exc())
-            await asyncio.sleep(1)
+    except Exception as e:
+        logger.error(f"Fatal error: {str(e)}")
+        logger.error(traceback.format_exc())
+        raise
 
 if __name__ == "__main__":
     asyncio.run(main()) 
