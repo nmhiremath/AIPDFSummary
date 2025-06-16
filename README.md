@@ -10,25 +10,28 @@ A modern web application for processing PDF documents using FastAPI, Redis, and 
 - Modern React frontend with Material-UI
 - FastAPI backend with comprehensive error handling
 - Docker-based deployment
+- Google Gemini 2.0 Flash AI integration for text extraction and summarization
+- Base64 encoding for secure PDF content handling
+- Improved error handling and validation
 
 ## Prerequisites
 
 - Docker and Docker Compose
 - Node.js and npm (for frontend development)
 - Python 3.8+ (for local development)
+- Google API Key for Gemini AI
 
 ## Project Structure
 
 ```
 .
 ├── app/
-│   ├── main.py
-│   ├── worker.py
-│   └── run_worker.py
+│   ├── main.py          # FastAPI application and API endpoints
+│   └── worker.py        # Redis worker for async processing
 ├── frontend/
 │   ├── src/
 │   │   ├── App.js
-│   │   └── index.js
+│   │   └── PDFUploader.js
 │   ├── public/
 │   │   └── index.html
 │   ├── package.json
@@ -47,7 +50,12 @@ A modern web application for processing PDF documents using FastAPI, Redis, and 
    cd pdf-processor
    ```
 
-2. Start the backend services using Docker Compose:
+2. Create a `.env` file in the root directory with your Google API key:
+   ```
+   GOOGLE_API_KEY=your_api_key_here
+   ```
+
+3. Start the backend services using Docker Compose:
    ```bash
    docker compose up --build
    ```
@@ -55,26 +63,35 @@ A modern web application for processing PDF documents using FastAPI, Redis, and 
    - FastAPI backend (port 8000)
    - Redis server
    - Worker process
-
-3. Start the frontend development server:
-   ```bash
-   cd frontend
-   npm install
-   npm start
-   ```
-   The frontend will be available at http://localhost:3000
+   - React frontend (port 3000)
 
 ## Usage
 
 1. **Main Interface (http://localhost:3000)**
-   - Upload PDF documents through the drag-and-drop interface
-   - View processing status and results
-   - Download processed documents
+   - Upload PDF documents through the interface
+   - Choose between PyPDF or Gemini AI for processing
+   - View real-time processing status
+   - See extracted text and generated summary
+   - View any processing errors
+
+2. **Processing Options**
+   - PyPDF: Basic text extraction
+   - Gemini AI: Advanced text extraction with markdown formatting and summarization
 
 ## API Endpoints
 
-- `POST /upload/`: Upload a PDF file
-- `GET /status/{task_id}`: Get processing status
+- `POST /upload`: Upload a PDF file
+  - Parameters:
+    - `file`: PDF file
+    - `parser`: Processing method ("pypdf" or "gemini")
+  - Returns: Document ID and initial status
+
+- `GET /status/{doc_id}`: Get processing status
+  - Returns:
+    - Status: "processing", "completed", or "error"
+    - Content: Extracted text in markdown format
+    - Summary: Generated summary
+    - Error: Error message if processing failed
 
 ## Development
 
@@ -88,7 +105,6 @@ A modern web application for processing PDF documents using FastAPI, Redis, and 
 
 2. Install dependencies:
    ```bash
-   cd backend
    pip install -r requirements.txt
    ```
 
@@ -132,16 +148,28 @@ A modern web application for processing PDF documents using FastAPI, Redis, and 
 1. **PDF Upload Issues**
    - Check file size (max 10MB)
    - Ensure PDF is not corrupted
-   - Verify backend service is running
+   - Verify PDF header is valid
+   - Check backend service is running
 
 2. **Processing Status Issues**
    - Verify worker service is running
    - Check backend logs for errors
+   - Ensure Redis connection is working
+   - Verify Google API key is valid
 
 3. **Connection Issues**
    - Ensure all services are running
    - Check port availability
    - Verify network connectivity
+   - Check CORS settings if accessing from different domains
+
+## Recent Updates
+
+- Upgraded to Gemini 2.0 Flash model for improved text extraction
+- Added base64 encoding for secure PDF content handling
+- Improved error handling and validation
+- Enhanced status reporting and error messages
+- Fixed Redis status encoding issues
 
 ## Contributing
 
