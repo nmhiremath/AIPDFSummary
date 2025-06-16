@@ -3,10 +3,10 @@ import os
 import json
 from dotenv import load_dotenv
 import asyncio
-from main import process_with_pypdf, process_with_gemini, generate_summary
 import logging
 import traceback
 import base64
+from utils import get_redis_client, REDIS_HOST, REDIS_PORT
 
 # Set up logging
 logging.basicConfig(
@@ -17,20 +17,10 @@ logger = logging.getLogger(__name__)
 
 load_dotenv()
 
-# Initialize Redis client
-REDIS_HOST = os.environ.get("REDIS_HOST", "redis")
-REDIS_PORT = int(os.environ.get("REDIS_PORT", 6379))
+# Redis stream configuration
 REDIS_STREAM = "pdf_tasks"
 REDIS_GROUP = "pdf_workers"
 REDIS_CONSUMER = "worker-1"
-
-async def get_redis_client(decode_responses=True):
-    """Get a Redis client with the specified configuration."""
-    return redis.Redis(
-        host=REDIS_HOST,
-        port=REDIS_PORT,
-        decode_responses=decode_responses
-    )
 
 async def process_document(doc_id: str, content: str, parser: str):
     """Process a document using the specified parser."""
@@ -38,33 +28,68 @@ async def process_document(doc_id: str, content: str, parser: str):
     try:
         logger.info(f"Starting to process document {doc_id} with parser {parser}")
         
+        # Update status to processing
+        await redis_client.hset(
+            f"document:{doc_id}",
+            mapping={
+                "status": "processing",
+                "progress": "Starting PDF processing...",
+                "current_step": "init",
+                "total_steps": "5",
+                "current_step_number": "0"
+            }
+        )
+        
         # Decode base64 content
         try:
+            await redis_client.hset(
+                f"document:{doc_id}",
+                mapping={
+                    "progress": "Decoding PDF content...",
+                    "current_step": "decode",
+                    "current_step_number": "1"
+                }
+            )
             content_bytes = base64.b64decode(content)
         except Exception as e:
             logger.error(f"Error decoding base64 content: {str(e)}")
             await redis_client.hset(
-                f"doc:{doc_id}",
+                f"document:{doc_id}",
                 mapping={
                     "status": "error",
-                    "error": "Invalid content format in Redis"
+                    "error": "Invalid content format in Redis",
+                    "progress": "Failed to decode PDF content"
                 }
             )
             raise ValueError("Invalid content format in Redis")
         
-        # Process with Gemini
+        # Process with selected parser
         if parser == "gemini":
             logger.info("Using Gemini parser")
             try:
-                result = await process_with_gemini(content_bytes)
+                # Convert PDF to images
+                await redis_client.hset(
+                    f"document:{doc_id}",
+                    mapping={
+                        "progress": "Converting PDF to images...",
+                        "current_step": "convert",
+                        "current_step_number": "2"
+                    }
+                )
+                
+                from main import process_with_gemini
+                result = await process_with_gemini(content_bytes, doc_id, redis_client)
                 
                 # Update Redis with results
                 await redis_client.hset(
-                    f"doc:{doc_id}",
+                    f"document:{doc_id}",
                     mapping={
                         "status": "completed",
                         "content": result["content"],
-                        "summary": result["summary"]
+                        "summary": result["summary"],
+                        "progress": "Processing completed successfully",
+                        "current_step": "complete",
+                        "current_step_number": "5"
                     }
                 )
                 logger.info(f"Successfully processed document {doc_id}")
@@ -72,10 +97,51 @@ async def process_document(doc_id: str, content: str, parser: str):
                 # Handle validation errors
                 logger.error(f"Validation error for document {doc_id}: {str(ve)}")
                 await redis_client.hset(
-                    f"doc:{doc_id}",
+                    f"document:{doc_id}",
                     mapping={
                         "status": "error",
-                        "error": str(ve)
+                        "error": str(ve),
+                        "progress": f"Error: {str(ve)}"
+                    }
+                )
+                raise
+        elif parser == "pypdf":
+            logger.info("Using PyPDF parser")
+            try:
+                # Process with PyPDF
+                await redis_client.hset(
+                    f"document:{doc_id}",
+                    mapping={
+                        "progress": "Processing with PyPDF...",
+                        "current_step": "process",
+                        "current_step_number": "2"
+                    }
+                )
+                
+                from main import process_with_pypdf
+                result = await process_with_pypdf(content_bytes)
+                
+                # Update Redis with results
+                await redis_client.hset(
+                    f"document:{doc_id}",
+                    mapping={
+                        "status": "completed",
+                        "content": result["content"],
+                        "summary": result["summary"],
+                        "progress": "Processing completed successfully",
+                        "current_step": "complete",
+                        "current_step_number": "5"
+                    }
+                )
+                logger.info(f"Successfully processed document {doc_id}")
+            except Exception as e:
+                logger.error(f"Error processing with PyPDF: {str(e)}")
+                await redis_client.hset(
+                    f"document:{doc_id}",
+                    mapping={
+                        "status": "error",
+                        "error": str(e),
+                        "progress": f"Error: {str(e)}"
                     }
                 )
                 raise
@@ -87,10 +153,11 @@ async def process_document(doc_id: str, content: str, parser: str):
         logger.error(f"Traceback: {e.__traceback__}")
         # Update Redis with error status
         await redis_client.hset(
-            f"doc:{doc_id}",
+            f"document:{doc_id}",
             mapping={
                 "status": "error",
-                "error": str(e)
+                "error": str(e),
+                "progress": f"Error: {str(e)}"
             }
         )
         raise
